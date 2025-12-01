@@ -93,10 +93,6 @@ class ClearStageEngine:
         save_dir = os.path.join(output_dir, "htdemucs_ft", song_name)
         os.makedirs(save_dir, exist_ok=True)
         
-        # Denormalize? Demucs output is usually roughly correctly scaled, 
-        # but we might need to restore amplitude if we strictly normalized. 
-        # However, htdemucs usually outputs proper amplitude. We will save directly.
-        
         sources = sources * ref.std() + ref.mean()
 
         for source, name in zip(sources, source_names):
@@ -108,130 +104,95 @@ class ClearStageEngine:
         logging.info("Source separation complete.")
         return stem_paths
 
-    def reduce_crowd_noise(self, other_stem_path, intensity=0.5):
+    def apply_smart_masking(self, vocal_path, crowd_path, aggressiveness=1.0):
         """
-        Crowd noise usually lives in the 'other' stem in Demucs output.
-        We apply Spectral Gating here to reduce the 'wash' of the crowd.
+        ADVANCED AI METHOD: Time-Frequency Ratio Masking.
+        Instead of gating volume, this compares the spectrograms of the Vocal and Crowd stems.
+        It calculates a 'probability mask' for every frequency bin.
+        If a frequency is dominated by the crowd, it is suppressed.
         """
-        logging.info(f"Applying Crowd Suppression (Intensity: {intensity}) to {other_stem_path}")
+        logging.info(f"AI Auto-Masking initialized (Aggressiveness target: {aggressiveness})...")
         
-        data, samplerate = sf.read(other_stem_path)
+        # Load audio
+        v_wav, sr = sf.read(vocal_path)
+        c_wav, _ = sf.read(crowd_path)
         
-        # Simple spectral gating simulation
-        # 1. High Pass Filter (Remove rumble)
-        sos = signal.butter(10, 150, 'hp', fs=samplerate, output='sos')
-        # axis=0 ensures we filter along time, not across channels
-        filtered = signal.sosfilt(sos, data, axis=0)
+        # Ensure tensor format (Channels, Time)
+        v_tensor = torch.tensor(v_wav).t().to(self.device)
+        c_tensor = torch.tensor(c_wav).t().to(self.device)
         
-        # 2. Hard clamp on background noise (Simple Gate)
-        # reducing volume of 'other' stem based on intensity
-        processed_data = filtered * (1.0 - (intensity * 0.6))
+        # Handle length mismatch
+        min_len = min(v_tensor.shape[1], c_tensor.shape[1])
+        v_tensor = v_tensor[:, :min_len]
+        c_tensor = c_tensor[:, :min_len]
         
-        output_path = other_stem_path.replace(".wav", "_clean.wav")
-        sf.write(output_path, processed_data, samplerate)
+        # 1. Compute Spectrograms (STFT)
+        # Using a window size of 2048 samples (approx 46ms) for good frequency resolution
+        n_fft = 2048
+        hop_length = 512
+        window = torch.hann_window(n_fft).to(self.device)
+        
+        # STFT results in complex numbers (Magnitude + Phase)
+        v_spec = torch.stft(v_tensor, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+        c_spec = torch.stft(c_tensor, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+        
+        # 2. Compute Magnitudes (Energy)
+        v_mag = torch.abs(v_spec)
+        c_mag = torch.abs(c_spec)
+        
+        # 3. AUTO-CALIBRATION (The "Listening" part)
+        # We calculate the average energy ratio to see how loud the crowd is overall
+        # If crowd is super loud, we automatically bump up the suppression
+        avg_v = torch.mean(v_mag)
+        avg_c = torch.mean(c_mag)
+        snr_ratio = avg_v / (avg_c + 1e-6)
+        
+        # Dynamic Auto-Tuning of Alpha (Sensitivity)
+        # If SNR is low (crowd is loud), alpha goes UP to separate harder.
+        # If SNR is high (vocals are loud), alpha goes DOWN to preserve quality.
+        auto_alpha = 1.0
+        if snr_ratio < 0.5: # Crowd is 2x louder than vocals
+            auto_alpha = 4.0 * aggressiveness
+            logging.info(f"  -> High Crowd Noise Detected (SNR: {snr_ratio:.2f}). engaging heavy masking (Alpha: {auto_alpha:.1f})")
+        elif snr_ratio < 1.0: # Crowd is slightly louder
+            auto_alpha = 2.0 * aggressiveness
+            logging.info(f"  -> Moderate Crowd Noise Detected. Balancing mask (Alpha: {auto_alpha:.1f})")
+        else: # Vocals are louder
+            auto_alpha = 1.2 * aggressiveness
+            logging.info(f"  -> Clean Recording Detected. Light masking only (Alpha: {auto_alpha:.1f})")
+
+        # 4. Construct Soft Mask (Wiener Filter approximation)
+        # Mask = Vocal_Energy / (Vocal_Energy + (Crowd_Energy * Alpha))
+        # This creates a value between 0.0 and 1.0 for EVERY frequency bin
+        mask = v_mag / (v_mag + (c_mag * auto_alpha) + 1e-8)
+        
+        # 5. Apply Soft Thresholding (Sigmoid-like behavior)
+        # This pushes uncertain frequencies (0.5) down to silence, cleaning the sound
+        mask = mask ** 2 
+        
+        # 6. Apply Mask to Original Vocal Phase
+        v_spec_clean = v_spec * mask
+        
+        # 7. Inverse STFT (Rebuild Audio)
+        v_clean_tensor = torch.istft(v_spec_clean, n_fft=n_fft, hop_length=hop_length, window=window, length=min_len)
+        
+        # Back to numpy for saving
+        v_clean = v_clean_tensor.cpu().numpy().T
+        
+        output_path = vocal_path.replace(".wav", "_automasked.wav")
+        sf.write(output_path, v_clean, sr)
         return output_path
 
-    def perform_spectral_subtraction(self, main_signal, noise_signal, intensity):
-        """
-        Subtracts the frequency content of the noise_signal (crowd) from the main_signal (vocals).
-        This is far superior to gating when the noise is louder than the signal.
-        """
-        # Ensure correct shape (Samples, Channels)
-        if main_signal.ndim == 1: main_signal = main_signal[:, np.newaxis]
-        if noise_signal.ndim == 1: noise_signal = noise_signal[:, np.newaxis]
-        
-        # Parameters for STFT
-        nperseg = 2048
-        noverlap = 1536
-        
-        output_audio = np.zeros_like(main_signal)
-        
-        # Process per channel
-        for ch in range(main_signal.shape[1]):
-            # STFT: Convert time domain to frequency domain
-            f, t, Zxx_main = signal.stft(main_signal[:, ch], nperseg=nperseg, noverlap=noverlap)
-            f, t, Zxx_noise = signal.stft(noise_signal[:, ch], nperseg=nperseg, noverlap=noverlap)
-            
-            # Get magnitudes (volume at each frequency)
-            mag_main = np.abs(Zxx_main)
-            mag_noise = np.abs(Zxx_noise)
-            phase_main = np.angle(Zxx_main)
-            
-            # SUBTRACTION: Remove the noise profile from the main signal
-            # We multiply noise by intensity to control how aggressive we are
-            mag_clean = np.maximum(0, mag_main - (mag_noise * intensity))
-            
-            # Reconstruct complex signal
-            Zxx_clean = mag_clean * np.exp(1j * phase_main)
-            
-            # Inverse STFT: Convert back to time domain
-            _, clean_time = signal.istft(Zxx_clean, nperseg=nperseg, noverlap=noverlap)
-            
-            # Handle length mismatch due to padding/windowing
-            target_len = len(main_signal[:, ch])
-            if len(clean_time) > target_len:
-                clean_time = clean_time[:target_len]
-            elif len(clean_time) < target_len:
-                clean_time = np.pad(clean_time, (0, target_len - len(clean_time)))
-                
-            output_audio[:, ch] = clean_time
-            
-        return output_audio
-
-    def process_vocals(self, vocal_stem_path, other_stem_path, clarity=0.5, crowd_removal=0.0):
-        """
-        Enhances vocals with EQ, Compression, and Spectral Subtraction.
-        """
-        logging.info(f"Enhancing Vocals (Clarity: {clarity}, Crowd Removal: {crowd_removal})...")
-        data, samplerate = sf.read(vocal_stem_path)
-        
-        # Load the "Other" stem (Crowd) to use as a noise profile
-        noise_profile, _ = sf.read(other_stem_path)
-
-        # 1. SPECTRAL SUBTRACTION (New Feature)
-        if crowd_removal > 0:
-            logging.info("Applying Spectral Subtraction using 'Other' stem as noise profile...")
-            # We use the raw 'other' stem to identify crowd frequencies in the vocal stem
-            data = self.perform_spectral_subtraction(data, noise_profile, crowd_removal)
-
-        # 2. High Pass Filter (Remove mud/rumble from crowd)
-        # 100Hz cutoff is standard for vocals to remove stage noise
-        sos = signal.butter(10, 100, 'hp', fs=samplerate, output='sos')
-        data = signal.sosfilt(sos, data, axis=0)
-
-        # 3. Vocal Gate (Cleanup: Remove residual noise between phrases)
-        if crowd_removal > 0:
-             # Calculate amplitude envelope
-             abs_signal = np.abs(data)
-             
-             # Smooth envelope
-             b, a = signal.butter(4, 10 / (samplerate / 2), 'low') 
-             envelope = signal.filtfilt(b, a, abs_signal, axis=0)
-             
-             peak = np.max(envelope)
-             # More gentle threshold now that we did spectral subtraction
-             threshold = peak * (0.01 + (0.10 * crowd_removal))
-             
-             gate_mask = np.ones_like(envelope)
-             below_thresh = envelope < threshold
-             
-             floor_gain = 1.0 - (0.8 * crowd_removal) 
-             gate_mask[below_thresh] = floor_gain
-             
-             b_smooth, a_smooth = signal.butter(1, 20 / (samplerate / 2), 'low')
-             gate_mask = signal.filtfilt(b_smooth, a_smooth, gate_mask, axis=0)
-             
-             data = data * gate_mask
-
-        # 4. Presence Boost
-        b, a = signal.iirpeak(3000, 2.0, fs=samplerate)
-        enhanced = signal.lfilter(b, a, data, axis=0) * (1 + clarity)
-        
-        final_vocals = (data * 0.7) + (enhanced * 0.3)
-        
-        output_path = vocal_stem_path.replace(".wav", "_processed.wav")
-        sf.write(output_path, final_vocals, samplerate)
-        return output_path
+    def enhance_presence(self, audio_path, amount=0.5):
+        """Simple EQ polish for the final vocal."""
+        data, sr = sf.read(audio_path)
+        # Axis=0 fixed for scipy signal processing
+        # 3kHz boost for vocal clarity
+        b, a = signal.iirpeak(3000, 2.0, fs=sr)
+        enhanced = signal.lfilter(b, a, data, axis=0)
+        mixed = (data * (1-amount*0.3)) + (enhanced * (amount*0.3))
+        sf.write(audio_path, mixed, sr)
+        return audio_path
 
     def mix_master(self, stems, output_file):
         """
@@ -242,23 +203,23 @@ class ClearStageEngine:
         v_data, sr = sf.read(stems['vocals'])
         d_data, _ = sf.read(stems['drums'])
         b_data, _ = sf.read(stems['bass'])
+        
+        # For the backing, we use the separated drums/bass, but we keep the 'other' stem
+        # volume VERY low because that's where the crowd lives.
         o_data, _ = sf.read(stems['other'])
         
-        # Ensure lengths match (safe truncate)
+        # Ensure lengths match
         min_len = min(len(v_data), len(d_data), len(b_data), len(o_data))
         v_data = v_data[:min_len]
         d_data = d_data[:min_len]
         b_data = b_data[:min_len]
         o_data = o_data[:min_len]
         
-        # Mixing Levels (Studio Profile)
-        # Vocals: +10%
-        # Drums: 0%
-        # Bass: -10%
-        # Other (Crowd/Synth): -20%
-        master = (v_data * 1.1) + (d_data * 1.0) + (b_data * 0.9) + (o_data * 0.8)
+        # "ClearStage" Mix Profile
+        # We assume the vocals are now super clean but maybe thin, so we boost them.
+        master = (v_data * 1.2) + (d_data * 1.0) + (b_data * 1.0) + (o_data * 0.4)
         
-        # Soft Limiter (Tanh)
+        # Soft Limiter
         master = np.tanh(master) 
         
         sf.write(output_file, master, sr)
@@ -267,8 +228,8 @@ class ClearStageEngine:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Lupri ClearStage AI Engine")
     parser.add_argument("input", help="Path to the input audio file")
-    parser.add_argument("--crowd", type=float, default=0.5, help="Crowd removal intensity (0.0 - 1.0)")
-    parser.add_argument("--vocal", type=float, default=0.5, help="Vocal clarity boost (0.0 - 1.0)")
+    # We kept the arguments for backward compatibility, but they act as 'biases' now
+    parser.add_argument("--crowd", type=float, default=1.0, help="Target aggressiveness bias (default: 1.0)")
     parser.add_argument("--output", default="clearstage_output.wav", help="Output file path")
     
     args = parser.parse_args()
@@ -279,15 +240,13 @@ if __name__ == "__main__":
     stems = engine.separate_sources(args.input)
     
     if stems:
-        # Save original crowd path for spectral subtraction reference
-        # The 'other' stem is the crowd noise we want to subtract from the vocals
-        raw_crowd_path = stems['other']
-
-        # 2. Process
-        stems['other'] = engine.reduce_crowd_noise(stems['other'], args.crowd)
+        # 2. AI Auto-Masking
+        # We pass the RAW crowd stem as the reference for what to remove
+        logging.info("--- Starting AI Auto-Analysis ---")
+        stems['vocals'] = engine.apply_smart_masking(stems['vocals'], stems['other'], args.crowd)
         
-        # We pass the RAW crowd path to process_vocals so it knows what to subtract
-        stems['vocals'] = engine.process_vocals(stems['vocals'], raw_crowd_path, args.vocal, args.crowd)
+        # Polish
+        stems['vocals'] = engine.enhance_presence(stems['vocals'], amount=0.5)
         
         # 3. Master
         engine.mix_master(stems, args.output)

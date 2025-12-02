@@ -8,9 +8,11 @@ The goal of this project is to take a raw live audio recording and intelligently
 I started this project to assist in Roehampton's Cabaret Night live recordings which were of poor quality.
 
 ## Features
-- **AI Source Separation**: Uses Demucs to separate audio into 4 stems.
-- **AI Smart Masking**: Uses Time-Frequency Ratio Masking and SNR-based auto-calibration to intelligently suppress crowd noise.
-- **Vocal Presence**: Applies targeted EQ to boost vocal clarity and presence.
+- **AI Source Separation**: Uses Demucs (HTDemucs_FT) for high-fidelity stem separation.
+- **Hard Center Vocal Extraction**: Removes stereo bleed using Mid-Side processing to isolate vocals.
+- **Crowd Taming**: Smooths stereo width and removes harsh transients from the crowd noise.
+- **Smart Vocal Ducking**: Automatically lowers backing tracks when vocals are present.
+- **Vocal Polishing**: Applies parallel compression and dynamic expansion for studio presence.
 - **Auto-Mastering**: Recombines stems with a "ClearStage" mixing profile.
 
 ## Usage

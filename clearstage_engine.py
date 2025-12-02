@@ -9,345 +9,355 @@ import sys
 import time
 import random
 import threading
+import shutil
 from scipy import signal
 
 # --- CONFIGURATION ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger().setLevel(logging.CRITICAL)
 
-class TerminalVisualizer:
-    """
-    Creates a cool 'Audio Visualizer' style loading bar in the terminal.
-    """
-    def __init__(self, description="Processing"):
-        self.description = description
+# --- VISUALIZER ---
+class FullScreenVisualizer:
+    def __init__(self, total_steps=6):
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.step_desc = "Initializing"
+        self.logs = []
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._animate)
-        # Unicode block elements for 'spectrum' bars
-        self.chars = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-        # ANSI colors (Cyan, Blue, Purple, White) for that cyberpunk look
-        self.colors = ["\033[96m", "\033[94m", "\033[95m", "\033[97m"]
+        
+        # Retro Terminal Colors
+        self.C_CYAN = "\033[96m"
+        self.C_MAGENTA = "\033[95m"
+        self.C_GREEN = "\033[92m"
+        self.C_ORANGE = "\033[93m"
+        self.C_GREY = "\033[90m"
+        self.C_RESET = "\033[0m"
+        self.C_BOLD = "\033[1m"
 
     def __enter__(self):
+        sys.stdout.write("\033[2J\033[H")
         self.thread.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.stop_event.set()
         self.thread.join()
-        # Clear the line
-        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.write(f"\033[{shutil.get_terminal_size().lines}H")
         sys.stdout.flush()
 
+    def log(self, message):
+        timestamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"{self.C_GREY}[{timestamp}]{self.C_RESET} {message}")
+        if len(self.logs) > 10:
+            self.logs.pop(0)
+
+    def update_step(self, step, desc):
+        self.current_step = step
+        self.step_desc = desc
+
     def _animate(self):
-        width = 30
         while not self.stop_event.is_set():
-            # Generate a random 'spectrum'
-            bar = ""
-            for _ in range(width):
-                color = random.choice(self.colors)
-                char = random.choice(self.chars)
-                bar += f"{color}{char}"
+            term_w, term_h = shutil.get_terminal_size()
+            sys.stdout.write("\033[H") # Go Home
+
+            # HEADER
+            print(f"{self.C_BOLD}{self.C_ORANGE}  LUPRI CLEARSTAGE v3.1 // DYNAMIC RECONSTRUCTION ENGINE  {self.C_RESET}".center(term_w))
+            print(f"{self.C_GREY}{'-'*term_w}{self.C_RESET}")
+
+            # DASHBOARD LAYOUT
+            print(f"\n {self.C_BOLD}PROCESS TELEMETRY:{self.C_RESET}")
             
-            # Reset color at end
-            sys.stdout.write(f"\r\033[1m{self.description}\033[0m \033[90m[\033[0m{bar}\033[0m\033[90m]\033[0m \033[3mAI Active...\033[0m")
+            # Simulated VU Meters
+            vu_l = random.randint(0, 20)
+            vu_r = random.randint(0, 20)
+            print(f" L [{self.C_GREEN}{'|'*vu_l}{self.C_GREY}{'.'*(20-vu_l)}{self.C_RESET}] -12dB")
+            print(f" R [{self.C_GREEN}{'|'*vu_r}{self.C_GREY}{'.'*(20-vu_r)}{self.C_RESET}] -12dB")
+
+            print("")
+            
+            # Main Progress
+            pct = int((self.current_step / self.total_steps) * 100)
+            bar_w = term_w - 20
+            filled = int((pct / 100) * bar_w)
+            bar = f"{self.C_CYAN}{'━'*filled}{self.C_GREY}{'┄'*(bar_w - filled)}{self.C_RESET}"
+            print(f" {self.C_BOLD}STATUS:{self.C_RESET} {pct}% COMPLETE")
+            print(f" [{bar}]")
+            print(f" {self.C_MAGENTA}>> {self.step_desc}{self.C_RESET}")
+
+            print(f"\n {self.C_BOLD}ENGINE LOGS:{self.C_RESET}")
+            print(f" {self.C_GREY}┌{'─' * (term_w-4)}┐{self.C_RESET}")
+            for log in self.logs:
+                clean_log = (log + " " * term_w)[:term_w-6]
+                print(f" {self.C_GREY}│{self.C_RESET} {clean_log}")
+            for _ in range(10 - len(self.logs)):
+                print(f" {self.C_GREY}│{self.C_RESET}")
+            print(f" {self.C_GREY}└{'─' * (term_w-4)}┘{self.C_RESET}")
+
             sys.stdout.flush()
             time.sleep(0.08)
 
+# --- AUDIO ENGINE ---
 class ClearStageEngine:
-    def __init__(self, use_gpu=True):
+    def __init__(self, use_gpu=True, visualizer=None):
         self.use_gpu = use_gpu
+        self.viz = visualizer
         
-        # Intelligent Device Detection
+        # GPU Check
         if self.use_gpu:
             if torch.cuda.is_available():
                 self.device = "cuda"
-                logging.info("NVIDIA GPU (CUDA) detected.")
+                self.viz.log("Core: CUDA Acceleration Enabled")
             elif torch.backends.mps.is_available():
                 self.device = "mps"
-                logging.info("Apple Silicon GPU (MPS) detected.")
+                self.viz.log("Core: Apple Metal (MPS) Enabled")
             else:
                 self.device = "cpu"
-                logging.warning("GPU requested but not available. Falling back to CPU.")
+                self.viz.log("Core: CPU Fallback Mode")
         else:
             self.device = "cpu"
 
-        logging.info(f"Initializing ClearStage Engine on {self.device.upper()}...")
-        
-        # Check for demucs
+        # Initialize Demucs
         try:
             import demucs.pretrained
             import demucs.apply
             self.demucs_pretrained = demucs.pretrained
             self.demucs_apply = demucs.apply
-            logging.info("Demucs library loaded successfully.")
         except ImportError:
-            logging.error("Demucs not found. Please run: pip install demucs")
+            print("Critical Error: Demucs library missing.")
             exit(1)
 
     def separate_sources(self, input_file, output_dir="temp_stems"):
-        """
-        Uses Demucs via direct library call to bypass Torchaudio backend issues.
-        """
-        logging.info(f"Loading Demucs model (htdemucs_ft) on {self.device}...")
+        self.viz.log(f"Separating Stems with HTDemucs_FT on {self.device.upper()}...")
         
-        # Load the model directly
         model = self.demucs_pretrained.get_model('htdemucs_ft')
         model.to(self.device)
         
-        logging.info(f"Separating sources for: {input_file}")
-        
-        # Load Audio using SoundFile (Safe from TorchCodec errors)
         try:
             wav, sr = sf.read(input_file)
         except Exception as e:
-            logging.error(f"Could not read audio file: {e}")
+            self.viz.log(f"File Error: {e}")
             return None
 
-        # Convert to Torch Tensor: (Time, Channels) -> (Channels, Time)
-        # .float() ensures float32, preventing MPS errors
+        # Prep Tensor
         wav = torch.tensor(wav).float()
-        if wav.dim() == 1:
-            wav = wav[None, :] # Add channel dim for mono
-            wav = wav.repeat(2, 1) # Force stereo
-        else:
-            wav = wav.t() 
+        if wav.dim() == 1: wav = wav[None, :].repeat(2, 1)
+        else: wav = wav.t() 
             
-        # Resample if necessary (Demucs htdemucs runs at 44.1kHz)
         if sr != model.samplerate:
-            logging.info(f"Resampling from {sr}Hz to {model.samplerate}Hz...")
             wav = torchaudio.functional.resample(wav, sr, model.samplerate)
             sr = model.samplerate
 
-        # Normalize (Standardize) for the model
+        # Standardize
         ref = wav.mean(0)
         wav_norm = (wav - ref.mean()) / (ref.std() + 1e-8)
-        
-        # Add batch dimension: (1, Channels, Time)
         wav_input = wav_norm[None, :, :].to(self.device)
 
-        # Apply Model
-        # We wrap this in our visualizer because it takes the longest
-        # We turn OFF the default progress bar (progress=False) so our visualizer owns the screen
-        with TerminalVisualizer("Separating Stems  "):
-            sources = self.demucs_apply.apply_model(model, wav_input, shifts=1, split=True, overlap=0.25, progress=False)[0]
+        # Infer
+        sources = self.demucs_apply.apply_model(model, wav_input, shifts=1, split=True, overlap=0.25, progress=False)[0]
         
-        # Sources order: drums, bass, other, vocals
-        source_names = model.sources
-        stem_paths = {}
-        
-        song_name = os.path.splitext(os.path.basename(input_file))[0]
-        save_dir = os.path.join(output_dir, "htdemucs_ft", song_name)
-        os.makedirs(save_dir, exist_ok=True)
-        
+        # Save
         sources = sources * ref.std() + ref.mean()
+        stem_paths = {}
+        song_name = os.path.splitext(os.path.basename(input_file))[0]
+        save_dir = os.path.join(output_dir, "clearstage_v3", song_name)
+        os.makedirs(save_dir, exist_ok=True)
 
-        for source, name in zip(sources, source_names):
-            source = source.cpu().numpy().T # Back to (Time, Channels)
+        for source, name in zip(sources, model.sources):
+            source = source.cpu().numpy().T 
             out_path = os.path.join(save_dir, f"{name}.wav")
             sf.write(out_path, source, sr)
             stem_paths[name] = out_path
             
-        logging.info("Source separation complete.")
         return stem_paths
 
-    def apply_smart_masking(self, vocal_path, crowd_path, aggressiveness=1.0):
+    def hard_center_extraction(self, audio_path):
         """
-        ADVANCED AI METHOD: Time-Frequency Ratio Masking.
+        VOCAL PROCESSING:
+        Aggressively removes stereo content from the Vocal stem.
+        Since vocals are mono, anything 'wide' is bleed/crowd.
         """
-        logging.info(f"AI Auto-Masking initialized (Aggressiveness target: {aggressiveness})...")
-        
-        v_wav, sr = sf.read(vocal_path)
-        c_wav, _ = sf.read(crowd_path)
-        
-        v_tensor = torch.tensor(v_wav).float().t().to(self.device)
-        c_tensor = torch.tensor(c_wav).float().t().to(self.device)
-        
-        min_len = min(v_tensor.shape[1], c_tensor.shape[1])
-        v_tensor = v_tensor[:, :min_len]
-        c_tensor = c_tensor[:, :min_len]
-        
-        with TerminalVisualizer("AI Spectral Masking"):
-            # STFT
-            n_fft = 2048
-            hop_length = 512
-            window = torch.hann_window(n_fft).to(self.device)
-            
-            v_spec = torch.stft(v_tensor, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
-            c_spec = torch.stft(c_tensor, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
-            
-            v_mag = torch.abs(v_spec)
-            c_mag = torch.abs(c_spec)
-            
-            # Auto-Calibration
-            rms_v = torch.sqrt(torch.mean(v_mag**2))
-            rms_c = torch.sqrt(torch.mean(c_mag**2))
-            snr_ratio = rms_v / (rms_c + 1e-6)
-            
-            # INCREASED AGGRESSIVENESS MULTIPLIERS
-            auto_alpha = 1.0
-            if snr_ratio < 1.5: 
-                auto_alpha = 6.0 * aggressiveness 
-            elif snr_ratio < 5.0:
-                auto_alpha = 3.5 * aggressiveness 
-            else:
-                auto_alpha = 1.5 * aggressiveness 
-
-            mask = v_mag / (v_mag + (c_mag * auto_alpha) + 1e-8)
-            mask = mask ** 2 
-            
-            v_spec_clean = v_spec * mask
-            v_clean_tensor = torch.istft(v_spec_clean, n_fft=n_fft, hop_length=hop_length, window=window, length=min_len)
-            
-            v_clean = v_clean_tensor.cpu().numpy().T
-            
-        # Log the decision AFTER the visualizer clears
-        if snr_ratio < 1.5:
-             logging.info(f"  -> Heavy Crowd/Noise (SNR: {snr_ratio:.2f}). MAX MASKING (Alpha: {auto_alpha:.1f})")
-        elif snr_ratio < 5.0:
-             logging.info(f"  -> Moderate Background Noise (SNR: {snr_ratio:.2f}). High masking (Alpha: {auto_alpha:.1f})")
-        else:
-             logging.info(f"  -> Clean Recording (SNR: {snr_ratio:.2f}). Standard masking (Alpha: {auto_alpha:.1f})")
-
-        output_path = vocal_path.replace(".wav", "_automasked.wav")
-        sf.write(output_path, v_clean, sr)
-        return output_path
-
-    def clean_backing_track(self, stem_path):
-        """
-        Cleans the 'Other' stem (Guitars/Keys) so we can boost it without boosting crowd.
-        Uses Spectral Gating.
-        """
-        logging.info(f"Cleaning Instrument Track: {stem_path}")
-        data, sr = sf.read(stem_path)
-        
-        with TerminalVisualizer("Filtering Stems   "):
-            # 1. Gentle High Pass to remove mud
-            sos = signal.butter(10, 80, 'hp', fs=sr, output='sos')
-            data = signal.sosfilt(sos, data, axis=0)
-            
-            # 2. Spectral Gate (Moderate settings to keep guitar sustain)
-            # We calculate an envelope and clamp down when volume drops (noise floor)
-            abs_signal = np.abs(data)
-            b, a = signal.butter(4, 5 / (sr / 2), 'low') # Slow envelope
-            envelope = signal.filtfilt(b, a, abs_signal, axis=0)
-            
-            peak = np.max(envelope)
-            threshold = peak * 0.15 # Gate everything below 15% volume
-            
-            gate_mask = np.ones_like(envelope)
-            below_thresh = envelope < threshold
-            
-            # Don't silence completely, just reduce noise by 60%
-            gate_mask[below_thresh] = 0.4 
-            
-            # Smooth the gate
-            b_s, a_s = signal.butter(1, 10 / (sr / 2), 'low')
-            gate_mask = signal.filtfilt(b_s, a_s, gate_mask, axis=0)
-            
-            data = data * gate_mask
-        
-        output_path = stem_path.replace(".wav", "_cleaned.wav")
-        sf.write(output_path, data, sr)
-        return output_path
-
-    def apply_studio_reverb(self, audio_path, amount=0.15):
-        """
-        Adds a synthetic 'Plate' reverb using convolution to make vocals natural.
-        """
-        logging.info(f"Applying Studio Reverb (Wet: {amount})...")
+        self.viz.log("Vocal: Removing Stereo Bleed (Hard Center)...")
         data, sr = sf.read(audio_path)
         
-        with TerminalVisualizer("Convolving Reverb "):
-            # Generate Impulse Response (Exponential Decay White Noise = Simple Plate)
-            duration = 1.5 # seconds
-            t = np.linspace(0, duration, int(sr * duration))
-            decay = np.exp(-5 * t)
-            noise = np.random.normal(0, 1, len(t))
-            ir = noise * decay
-            
-            # Normalize IR
-            ir = ir / np.max(np.abs(ir))
-            
-            # Convolve (Process per channel)
-            wet_signal = np.zeros_like(data)
-            for i in range(data.shape[1]):
-                # mode='same' keeps length equal to input
-                wet_signal[:, i] = signal.convolve(data[:, i], ir, mode='full')[:len(data)]
-            
-            # Blend Dry/Wet
-            mixed = (data * 0.9) + (wet_signal * amount * 0.1) # amount is scaled down
+        if data.ndim == 1: return audio_path
+
+        # Mid-Side
+        mid = (data[:, 0] + data[:, 1]) * 0.5
         
-        output_path = audio_path.replace(".wav", "_reverb.wav")
+        # Discard Side channel completely for Vocals
+        # Reconstruct as Dual Mono
+        new_l = mid
+        new_r = mid
+        stereo_clean = np.column_stack((new_l, new_r))
+        
+        output_path = audio_path.replace(".wav", "_center.wav")
+        sf.write(output_path, stereo_clean, sr)
+        return output_path
+
+    def tame_crowd_stereo(self, audio_path):
+        """
+        CROWD PROCESSING:
+        Keeps the crowd width but removes harsh transients (clapping)
+        and high frequencies from the sides to make it sound 'behind' the singer.
+        """
+        self.viz.log("Crowd: Smoothing Stereo Width...")
+        data, sr = sf.read(audio_path)
+        if data.ndim == 1: return audio_path
+
+        mid = (data[:, 0] + data[:, 1]) * 0.5
+        side = (data[:, 0] - data[:, 1]) * 0.5
+
+        # 1. Low Pass the Side Channel (6kHz) to kill whistling/clapping sizzle
+        sos_lp = signal.butter(4, 6000, 'low', fs=sr, output='sos')
+        side = signal.sosfilt(sos_lp, side, axis=0)
+
+        # 2. Transient Smear (Limiter) on Side
+        # Crushes spikes in the stereo field
+        side = np.tanh(side * 2.0) * 0.5
+        
+        # Reconstruct
+        new_l = mid + side
+        new_r = mid - side
+        stereo = np.column_stack((new_l, new_r))
+        
+        output_path = audio_path.replace(".wav", "_tamed.wav")
+        sf.write(output_path, stereo, sr)
+        return output_path
+
+    def smart_vocal_ducking(self, vocal_path, backing_path, depth=0.4):
+        """
+        DYNAMIC MIXING:
+        Lowers the Backing Track volume automatically when the Singer is active.
+        depth=0.4 means ~40% reduction (-4dB) during vocals.
+        """
+        self.viz.log("Mixing: Applying Smart Vocal Ducking...")
+        v_data, sr = sf.read(vocal_path)
+        b_data, _ = sf.read(backing_path)
+        
+        # 1. Get Vocal Envelope
+        abs_v = np.abs(v_data)
+        # Slow Lowpass (5Hz) for smooth fading
+        sos = signal.butter(4, 5, 'low', fs=sr, output='sos')
+        if v_data.ndim > 1: abs_v = np.mean(abs_v, axis=1) # Mono envelope
+        env = signal.sosfilt(sos, abs_v, axis=0)
+        
+        # Normalize Envelope 0-1
+        peak = np.max(env)
+        if peak > 0: env = env / peak
+        
+        # 2. Create Gain Curve
+        # Invert envelope: Loud Vocal = Low Gain
+        gain_curve = 1.0 - (env * depth)
+        
+        # Apply to backing track (handle channels)
+        if b_data.ndim > 1:
+            gain_curve = gain_curve[:, np.newaxis]
+            
+        # Ensure lengths match
+        min_len = min(len(b_data), len(gain_curve))
+        b_data = b_data[:min_len] * gain_curve[:min_len]
+        
+        output_path = backing_path.replace(".wav", "_ducked.wav")
+        sf.write(output_path, b_data, sr)
+        return output_path
+
+    def vocal_polishing(self, audio_path):
+        """
+        Restores body to the center-extracted vocals.
+        """
+        self.viz.log("Vocal: Parallel Compression & EQ...")
+        data, sr = sf.read(audio_path)
+        
+        # 1. Dynamic Expansion (Gate noise floor)
+        sos_hp = signal.butter(4, 100, 'hp', fs=sr, output='sos')
+        data_f = signal.sosfilt(sos_hp, data, axis=0)
+        abs_sig = np.abs(data_f)
+        b, a = signal.butter(4, 10/(sr/2), 'low') 
+        env = signal.filtfilt(b, a, abs_sig, axis=0)
+        peak = np.max(env)
+        thresh = peak * 0.05
+        gain_map = np.ones_like(env)
+        mask = env < thresh
+        gain_map[mask] = (env[mask] / thresh) ** 0.5
+        gain_map = np.maximum(gain_map, 0.1)
+        data = data * gain_map
+
+        # 2. Parallel Compression (Body)
+        crushed = np.tanh(data * 4.0)
+        mixed = (data * 0.75) + (crushed * 0.15)
+        
+        # 3. Presence Boost (3kHz)
+        sos_pres = signal.butter(2, [2500, 4000], 'bandpass', fs=sr, output='sos')
+        pres = signal.sosfilt(sos_pres, mixed, axis=0)
+        mixed = mixed + (pres * 0.2)
+
+        output_path = audio_path.replace(".wav", "_polished.wav")
         sf.write(output_path, mixed, sr)
         return output_path
 
-    def enhance_presence(self, audio_path, amount=0.5):
-        """Simple EQ polish for the final vocal."""
-        data, sr = sf.read(audio_path)
-        # 3kHz boost for vocal clarity
-        b, a = signal.iirpeak(3000, 2.0, fs=sr)
-        enhanced = signal.lfilter(b, a, data, axis=0)
-        mixed = (data * (1-amount*0.3)) + (enhanced * (amount*0.3))
-        sf.write(audio_path, mixed, sr)
-        return audio_path
-
     def mix_master(self, stems, output_file):
         """
-        Recombines the processed stems into a final stereo master.
+        Final Analog Summing.
         """
-        logging.info("Remixing stems into final master...")
+        def load(p): 
+            d, s = sf.read(p)
+            if d.ndim == 1: d = d[:, np.newaxis]
+            return d, s
+
+        v, sr = load(stems['vocals'])
+        d, _ = load(stems['drums'])
+        b, _ = load(stems['bass'])
+        o, _ = load(stems['other']) # Now ducked/tamed
         
-        v_data, sr = sf.read(stems['vocals'])
-        d_data, _ = sf.read(stems['drums'])
-        b_data, _ = sf.read(stems['bass'])
-        o_data, _ = sf.read(stems['other'])
+        # Safe Trim
+        ln = min(len(v), len(d), len(b), len(o))
+        v=v[:ln]; d=d[:ln]; b=b[:ln]; o=o[:ln]
         
-        # Ensure lengths match
-        min_len = min(len(v_data), len(d_data), len(b_data), len(o_data))
-        v_data = v_data[:min_len]
-        d_data = d_data[:min_len]
-        b_data = b_data[:min_len]
-        o_data = o_data[:min_len]
+        # --- MIX PROFILE ---
+        # Vocals: Up front
+        # Crowd: Pushed back (-4dB)
+        master = (v * 1.05) + (d * 1.0) + (b * 1.0) + (o * 0.65)
         
-        with TerminalVisualizer("Final Mixdown     "):
-            # "ClearStage" Studio Profile
-            # 1. Vocals are now cleaner, so we can push them.
-            # 2. Instruments (Other) are cleaned, so we can BOOST them (1.3x)
-            # 3. Drums/Bass get a solid foundation.
-            master = (v_data * 1.0) + (d_data * 1.3) + (b_data * 1.2) + (o_data * 1.3)
-            
-            # Soft Limiter / Saturation
-            master = np.tanh(master * 1.1) # Slight drive
+        # Master Limiter (Soft Knee)
+        master = np.tanh(master * 1.1)
         
         sf.write(output_file, master, sr)
-        logging.info(f"Done! Saved to {output_file}")
+        self.viz.log(f"Render Complete: {output_file}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lupri ClearStage AI Engine")
-    parser.add_argument("input", help="Path to the input audio file")
-    parser.add_argument("--crowd", type=float, default=1.0, help="Target aggressiveness bias (default: 1.0)")
-    parser.add_argument("--output", default="clearstage_output.wav", help="Output file path")
-    
+    parser = argparse.ArgumentParser(description="Lupri ClearStage v3.1")
+    parser.add_argument("input", help="Input file")
+    parser.add_argument("--output", default="clearstage_master.wav", help="Output file")
     args = parser.parse_args()
     
-    engine = ClearStageEngine(use_gpu=True)
-    
-    # 1. Separate
-    stems = engine.separate_sources(args.input)
-    
-    if stems:
-        logging.info("--- Starting AI Auto-Analysis ---")
+    with FullScreenVisualizer(total_steps=6) as viz:
+        engine = ClearStageEngine(use_gpu=True, visualizer=viz)
         
-        # 2. Clean Vocals (Heavy Masking)
-        stems['vocals'] = engine.apply_smart_masking(stems['vocals'], stems['other'], args.crowd)
+        # 1. Separation
+        viz.update_step(1, "Spectral Separation (Demucs)")
+        stems = engine.separate_sources(args.input)
         
-        # 3. Clean Instruments (Gating) - New Step
-        # This removes crowd form the 'guitar' stem so we can boost it later
-        stems['other'] = engine.clean_backing_track(stems['other'])
-        
-        # 4. Polish Vocals (EQ + Reverb)
-        stems['vocals'] = engine.enhance_presence(stems['vocals'], amount=0.6)
-        stems['vocals'] = engine.apply_studio_reverb(stems['vocals'], amount=0.25)
-        
-        # 5. Master
-        engine.mix_master(stems, args.output)
+        if stems:
+            # 2. Vocal Isolation
+            viz.update_step(2, "Vocal: Hard Center Extraction")
+            stems['vocals'] = engine.hard_center_extraction(stems['vocals'])
+            
+            # 3. Crowd Taming
+            viz.update_step(3, "Crowd: Side-Channel Smoothing")
+            stems['other'] = engine.tame_crowd_stereo(stems['other'])
+            
+            # 4. Vocal Polish
+            viz.update_step(4, "Vocal: Dynamics & Presence")
+            stems['vocals'] = engine.vocal_polishing(stems['vocals'])
+            
+            # 5. Smart Mixing
+            viz.update_step(5, "Mix: Smart Vocal Ducking")
+            # We duck the 'other' stem (crowd) based on the 'vocals' stem
+            stems['other'] = engine.smart_vocal_ducking(stems['vocals'], stems['other'], depth=0.4)
+            
+            # 6. Master
+            viz.update_step(6, "Mastering: Analog Summing")
+            engine.mix_master(stems, args.output)
+            
+            viz.log("SESSION COMPLETE.")
+            time.sleep(3)
